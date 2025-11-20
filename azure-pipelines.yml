@@ -1,0 +1,522 @@
+trigger:
+  branches:
+    include:
+      - dev
+      - staging
+      - main
+      - refs/heads/hotfix/*
+      - refs/heads/prehotfix/*
+  tags:
+    include:
+      - '*-release'
+
+variables:
+  # Conditional for Stage
+  - name: isDevBranch
+    value: ${{ eq(variables['Build.SourceBranchName'], 'dev') }}
+  - name: isStagingBranch
+    value: ${{ eq(variables['Build.SourceBranchName'], 'staging') }}
+  - name: isMainBranch
+    value: ${{ eq(variables['Build.SourceBranchName'], 'main') }}
+  - name: isReleaseTag
+    value: ${{lower(and(startsWith(variables['Build.SourceBranch'], 'refs/tags/'), endsWith(variables['Build.SourceBranch'], '-release')))}}
+  #  value: ${{lower(and(startsWith(variables['Build.SourceBranch'], 'refs/tags/'), endsWith(variables['Build.SourceBranch'], '-release'), not(contains(variables['Build.SourceBranchName'], 'hotfix')), not(contains(variables['Build.SourceBranchName'], 'prehotfix')), not(contains(variables['Build.SourceBranchName'], 'alpha')), not(contains(variables['Build.SourceBranchName'], 'beta')), not(contains(variables['Build.SourceBranchName'], 'rc'))))}}
+  # Group Variable
+  - group: 'ci-credentials'
+  # Pipeline Variable
+  - name: MONGO_URI
+    value: 'mongodb+srv://supercluster.d83jj.mongodb.net/superData'
+  - name: nodeVersion
+    value: '18.x'
+  - name: NODE_VERSION
+    value: '20.x'
+  # Image Variable
+  - name: imageName
+    value: 'solar-system/app'
+  - name: shortSha
+    value: $[substring(variables['Build.SourceVersion'], 0, 8)]
+  - name: buildTag
+    ${{ if startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+      value: '$(Build.SourceBranchName)'
+    ${{ else }}:
+      value: 'build-$(shortSha)'
+
+stages:
+
+### PREPARE SEMANTIC VERSIONING STAGE ###
+
+- stage: Prepare
+  displayName: 'Prepare Semantic Version Environment'
+  jobs:
+  - job: SetupNode
+    displayName: 'Setup Node Environment'
+    pool:
+      name: 'Self-Hosted Docker Runner'
+    steps:
+      - task: NodeTool@0
+        displayName: 'Install Node.js'
+        inputs:
+          versionSpec: '$(NODE_VERSION)'
+      
+      - script: |
+          node --version
+          npm --version
+        displayName: 'Check Node and NPM versions'
+      
+      - script: |
+          rm -f package.json
+          cat <<EOF > package.json
+          {
+            "name": "semantic",
+            "version": "1.0.0",
+            "devDependencies": {
+              "@commitlint/cli": "^19.8.0",
+              "@commitlint/config-conventional": "^19.8.0",
+              "@semantic-release/changelog": "^6.0.3",
+              "@semantic-release/git": "^10.0.1",
+              "@semantic-release/npm": "^12.0.1",
+              "semantic-release": "^24.2.3"
+            }
+          }
+          EOF
+          cat package.json
+        displayName: 'Generate package.json'
+      
+      - task: Cache@2
+        displayName: 'Cache node_modules'
+        inputs:
+          key: 'npm | "$(Agent.OS)" | package.json'
+          path: 'node_modules'
+          restoreKeys: |
+            npm | "$(Agent.OS)"
+      
+      - script: npm install
+        displayName: 'Install npm dependencies'
+      
+      - script: |
+          git fetch --prune origin
+          git remote prune origin
+          git --version
+        displayName: 'Setup Git'
+        condition: eq(variables['Agent.OS'], 'Linux')
+
+      - script: |
+          echo $(Build.SourceBranch)
+          echo $(Build.SourceBranchName)
+          echo $(isReleaseTag)
+        displayName: 'Debug Variable'
+
+### VERIFY COMMIT MESSAGE SEMANTIC VERSIONING STAGE ###
+
+- stage: Verify
+  displayName: 'Verify Semantic Version'
+  dependsOn: Prepare
+  condition: |
+    or(
+      eq(variables.isDevBranch, 'true'),
+      eq(variables.isStagingBranch, 'true'),
+      eq(variables.isMainBranch, 'true'),
+      startsWith(variables['Build.SourceBranchName'], 'prehotfix/')
+    )
+  jobs:
+  - job: VerifyCommitMessage
+    displayName: 'Verify Commit Message'
+    pool:
+      name: 'Self-Hosted Docker Runner'
+    steps:
+      - task: NodeTool@0
+        displayName: 'Install Node.js'
+        inputs:
+          versionSpec: '$(NODE_VERSION)'
+      
+      - task: Cache@2
+        displayName: 'Restore node_modules cache'
+        inputs:
+          key: 'npm | "$(Agent.OS)" | package.json'
+          path: 'node_modules'
+          restoreKeys: |
+            npm | "$(Agent.OS)"
+      
+      - script: |
+          rm -f package.json
+          cat <<EOF > package.json
+          {
+            "name": "semantic",
+            "version": "1.0.0",
+            "devDependencies": {
+              "@commitlint/cli": "^19.8.0",
+              "@commitlint/config-conventional": "^19.8.0",
+              "@semantic-release/changelog": "^6.0.3",
+              "@semantic-release/git": "^10.0.1",
+              "@semantic-release/npm": "^12.0.1",
+              "semantic-release": "^24.2.3"
+            }
+          }
+          EOF
+          npm install
+        displayName: 'Setup dependencies'
+      
+      - script: |
+          mkdir -p commitlint
+          cd commitlint
+          echo "module.exports = { extends: ['@commitlint/config-conventional'] };" > .commitlintrc.js
+          cat .commitlintrc.js
+        displayName: 'Create commitlint config'
+      
+      - script: |
+          cd commitlint
+          node --version
+          echo "$(Build.SourceVersionMessage)" | npx commitlint --config .commitlintrc.js
+        displayName: 'Verify commit message'
+
+### BUILD, TEST, SAST WITH SONARQUBE STAGE ###
+
+- stage: BuildTestApp
+  displayName: 'Build and Test' 
+  condition: |
+    or(
+      eq(variables.isDevBranch, 'true'),
+      eq(variables.isStagingBranch, 'true'),
+      eq(variables.isReleaseTag, 'true')
+    )
+  jobs:
+  - job: BuildTest
+    pool:
+      name: 'Self-Hosted Docker Runner'
+
+    steps:
+    - task: UseNode@1
+      displayName: 'Install Node.js'
+      inputs:
+        version: $(nodeVersion)
+
+    # Install dependencies
+    - script: |
+        npm install
+      displayName: 'Install dependencies'
+
+    # Run tests
+    - script: |
+        npm test
+      displayName: 'Run tests'
+      env:
+        MONGO_URI: $(MONGO_URI)
+        MONGO_USERNAME: $(MONGO_USERNAME)
+        MONGO_PASSWORD: $(MONGO_PASSWORD)
+
+    # Copy project files to artifact staging directory
+    - task: CopyFiles@2
+      inputs:
+        sourceFolder: '$(Build.SourcesDirectory)'
+        contents: |
+          src/**
+          public/**
+        targetFolder: '$(Build.ArtifactStagingDirectory)'
+      displayName: 'Copy project files'
+
+    - script: |
+        npm run coverage
+      displayName: 'Run Unit Test'
+      
+    - task: UseDotNet@2
+      displayName: "Install .NET for Coverage Publisher"
+      inputs:
+        packageType: runtime
+        version: '6.x'
+    
+    - task: PublishCodeCoverageResults@2
+      displayName: "Publish Code Coverage"
+      inputs:
+        # codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Build.SourcesDirectory)/coverage/lcov.info'
+        # reportDirectory: 'coverage'
+
+    # Publish pipeline artifact
+    - task: PublishPipelineArtifact@1
+      inputs:
+        artifactName: 'nodejs-app'
+        targetPath: '$(Build.SourcesDirectory)/coverage'
+      displayName: 'Publish pipeline artifact'
+
+### SAST SONAR STAGE ###
+
+- stage: SastSonar
+  displayName: 'SAST with Sonarqube' 
+  condition: |
+    and(
+      succeeded(),
+      or(
+        eq(variables.isDevBranch, 'true'),
+        eq(variables.isStagingBranch, 'true'),
+        eq(variables.isReleaseTag, 'true')
+      )
+    )
+  jobs:
+  - job: SonarSast
+    pool:
+      name: 'Self-Hosted Docker Runner'
+
+    steps:    
+    # Download artifact from previous stage
+    - task: DownloadPipelineArtifact@2
+      inputs:
+        artifact: 'nodejs-app'
+        path: '$(Pipeline.Workspace)/coverage'
+      displayName: 'Download artifact from BuildTestApp'
+
+    - script: |
+        echo "====== Searching lcov.info ======"
+        echo "Build.SourcesDirectory"
+        find $(Build.SourcesDirectory) -type f -name "lcov.info"
+        echo "Agent.TempDirectory"
+        find $(Agent.TempDirectory) -type f -name "lcov.info"
+        echo "Pipeline.Workspace"
+        find $(Pipeline.Workspace) -type f -name "lcov.info"
+      displayName: "Find lcov.info"
+
+    - checkout: self
+      fetchDepth: 0
+
+    - task: SonarQubePrepare@7
+      inputs:
+        SonarQube: 'sonarqube-labsre3'
+        scannerMode: 'cli'
+        configMode: 'manual'
+        cliProjectKey: 'solar-system'
+        extraProperties: |
+          sonar.javascript.lcov.reportPaths=$(Pipeline.Workspace)/coverage/lcov.info
+          sonar.exclusions=**/*controller.js, **/app-test.js
+      displayName: 'Prepare Analysis Configuration'
+
+    - task: SonarQubeAnalyze@7
+      inputs:
+        jdkversion: 'JAVA_HOME_21_X64'
+      displayName: 'Run Code Analysis'
+
+    - task: SonarQubePublish@7
+      inputs:
+        pollingTimeoutSec: '300'
+      displayName: 'Publish Quality Gate Result'
+
+### BUILD IMAGE APP STAGE ###
+
+- stage: BuildImage
+  displayName: Build Image
+  condition: |
+    or(
+      eq(variables.isStagingBranch, 'true'),
+      eq(variables.isReleaseTag, 'true')
+    )
+  jobs:
+  - job: BuildAndPushImage
+    pool:
+      name: 'Self-Hosted Docker Runner'
+    steps:
+    - task: Docker@2
+      displayName: Login to Harbor
+      inputs:
+        containerRegistry: 'Harbor Labsre3'
+        command: 'login'
+
+    - task: Docker@2
+      displayName: Build Docker Image
+      inputs:
+        repository: '$(imageName)'
+        tags: '$(buildTag)'
+        command: 'build'
+        Dockerfile: './Dockerfile'
+
+    - task: Docker@2
+      displayName: Push Image to Harbor
+      inputs:
+        repository: '$(imageName)'
+        command: 'push'
+        tags: '$(buildTag)'
+
+    - task: Docker@2
+      displayName: Logout from Harbor
+      inputs:
+        command: 'logout'
+
+### APPROVAL DEPLOY STAGING STAGE ###
+
+- stage: ApprovalStag
+  displayName: Approval Deploy Staging
+  condition: |
+    and(
+      succeeded('BuildImage'),
+      eq(variables.isStagingBranch, 'true')
+    )
+  dependsOn: BuildImage
+  jobs:
+  - deployment: ApprovalDeployStaging
+    environment: staging
+    pool:
+      name: 'Self-Hosted Docker Runner'
+
+### DEPLOY STAGING STAGE ###
+
+- stage: DeployStag
+  displayName: Deploy Staging
+  condition: |
+    and(
+      succeeded('ApprovalStag'),
+      eq(variables.isStagingBranch, 'true')
+    )
+  dependsOn: ApprovalStag
+  jobs:
+  - job: DeployStaging
+    pool:
+      name: 'Self-Hosted Docker Runner'
+    steps:
+    - script: |
+        echo "Updating Deployment Repository with tag $(buildTag)"
+        git clone "$(DEPLOYMENT_REPOSITORY)" .manifest
+        cd .manifest/environments
+        app_tag=$(awk '/appTag:/ {print $2}' values-stag.yaml)
+        sed -i "s/appTag: ${app_tag}/appTag: $(buildTag)/g" values-stag.yaml
+        git config --global user.email "erp-lab@packet-systems.cloud"
+        git config --global user.name "erp-lab"
+        git add values-stag.yaml
+        git commit -m "Update Staging App Image Version to version $(buildTag)" && git push origin staging
+      displayName: Update Tag Staging App Image
+
+### RELEASE PRODUCTION TAG SEMANTIC VERSIONING STAGE ###
+
+- stage: Release
+  displayName: 'Release to Production'
+  dependsOn: Verify
+  condition: |
+    and(
+      succeeded(),
+      or(
+        eq(variables.isMainBranch, 'true'),
+        startsWith(variables['Build.SourceBranchName'], 'prehotfix/')
+      )
+    )
+  jobs:
+  - job: SemanticRelease
+    displayName: 'Semantic Release'
+    pool:
+      name: 'Self-Hosted Docker Runner'
+    steps:
+      - task: NodeTool@0
+        displayName: 'Install Node.js'
+        inputs:
+          versionSpec: '$(NODE_VERSION)'
+      
+      - task: Cache@2
+        displayName: 'Restore node_modules cache'
+        inputs:
+          key: 'npm | "$(Agent.OS)" | package.json'
+          path: 'node_modules'
+          restoreKeys: |
+            npm | "$(Agent.OS)"
+      
+      - script: |
+          rm -f package.json
+          cat <<EOF > package.json
+          {
+            "name": "semantic",
+            "version": "1.0.0",
+            "devDependencies": {
+              "@commitlint/cli": "^19.8.0",
+              "@commitlint/config-conventional": "^19.8.0",
+              "@semantic-release/changelog": "^6.0.3",
+              "@semantic-release/git": "^10.0.1",
+              "@semantic-release/npm": "^12.0.1",
+              "semantic-release": "^24.2.3"
+            }
+          }
+          EOF
+          npm install
+        displayName: 'Setup dependencies'
+      
+      - script: |
+          apt-get install -y git curl openssh-client
+        displayName: 'Install system dependencies'
+      
+      - script: |
+          echo "Preparing SSH known hosts..."
+          mkdir -p ~/.ssh
+          ssh-keyscan ssh.dev.azure.com >> ~/.ssh/known_hosts
+        displayName: 'Add Azure DevOps SSH Host'
+
+      - task: InstallSSHKey@0
+        displayName: 'Install SSH Key'
+        inputs:
+          knownHostsEntry: 'ssh.dev.azure.com'
+          # sshPublicKey: 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDHWcL94PccY8Qpz6MDOPsH5vba+prP6HbTlavuuLPpEDEa3cmiYDfAPHo78VGhHRc+P2FHgGfep3rVJPIjCugvPXDpn27SOFKm85QWwZtZZZqY73kmgm3PK8d1lMMd0jd2bgDehc6ZjLKZKJ/t+fb6V8YvfpO8+83JC26mBsH0WHb6co0OAHeK8uOVg0UGrL//HYbVmHBDzUNuO+dcbYVDbAFsrLvsPalgRTPqfe31KlmOhSlTTZP/StwSTQvJ/G9bzDYEZxWQO61sRMmn7jWRX4rjxWSbdtaWWMh4j2wcpRHCTDkM6qvUQuQLekJ3mz8X9/YhXwjjlKdsQInxtjUqyWH3IHDCtnMDpwmvVLjF92MCi5h66CuFCO3az3DHt6yKOT/foLepCDZoc6mE775pkNCCFkJYEiTfXeSAUuHH8YuaVCSxZKQoTwnEdXrKLhGAD7e0wdugYjj1ykpalOOrJ2pebJmJoaWAxacJvCiLv8AqrdfhP06Lvj0Cws6nV28= cloudops@pln-lab-gitlab-runner'
+          sshKeySecureFile: 'id_rsa'
+      
+      - script: |
+          git config --global user.name "Azure DevOps CI/CD"
+          git config --global user.email "erp-lab@packet-systems.cloud"
+          git config --global http.sslVerify false
+        displayName: 'Configure Git'
+      
+      - script: |
+          echo "Running semantic-release..."
+          DRY_RUN_OUTPUT=$(npx semantic-release --dry-run)
+          echo "$DRY_RUN_OUTPUT"
+          
+          if echo "$DRY_RUN_OUTPUT" | grep -qi "The next release version is" ; then
+            NEW_VERSION=$(echo "$DRY_RUN_OUTPUT" | grep -i 'The next release version is' | sed -E 's/.*The next release version is ([0-9]+\.[0-9]+\.[0-9]+).*/\1/' )
+            echo "New version: $NEW_VERSION"
+            echo "$NEW_VERSION" > new_version.txt
+            npx semantic-release
+          else
+            echo "No new version to release"
+            echo "No new version" > new_version.txt
+          fi
+        displayName: 'Run Semantic Release'
+      
+      - task: PublishPipelineArtifact@1
+        inputs:
+          targetPath: '$(Pipeline.Workspace)'
+          artifact: 'release'
+          publishLocation: 'pipeline'
+
+### APPROVAL DEPLOY PRODUCTION STAGE ###
+
+- stage: ApprovalProd
+  displayName: Approval Deploy Production
+  condition: |
+    and(
+      succeeded('BuildImage'),
+      eq(variables.isReleaseTag, 'true')
+    )
+  dependsOn: BuildImage
+  jobs:
+  - deployment: ApprovalDeployProduction
+    environment: production
+    pool:
+      name: 'Self-Hosted Docker Runner'
+
+#### DEPLOY PRODUCTION STAGE ###
+
+- stage: DeployProd
+  displayName: Deploy Production
+  condition: |
+    and(
+      succeeded('ApprovalProd'),
+      eq(variables.isReleaseTag, 'true')
+    )
+  dependsOn: ApprovalProd
+  jobs:
+  - job: DeployProduction
+    pool:
+      name: 'Self-Hosted Docker Runner'
+    steps:
+    - script: |
+        echo "Updating Deployment Repository with tag $(buildTag)"
+        git clone "$(DEPLOYMENT_REPOSITORY)" .manifest
+        cd .manifest/environments
+        git checkout production
+        app_tag=$(awk '/appTag:/ {print $2}' values-prod.yaml)
+        sed -i "s/appTag: ${app_tag}/appTag: $(buildTag)/g" values-prod.yaml
+        git config --global user.email "erp-lab@packet-systems.cloud"
+        git config --global user.name "erp-lab"
+        git add values-prod.yaml
+        git commit -m "Update Production App Image Version to version $(buildTag)" && git push origin production
+      displayName: Update Tag Production App Image
